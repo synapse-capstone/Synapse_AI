@@ -1,9 +1,58 @@
+# ---------------------------
+# Python / Packaging
+# ---------------------------
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---------------------------
+# Virtual env / Environment
+# ---------------------------
 .venv/
-.DS_Store
+venv/
+env/
 .env
+
+# ---------------------------
+# Editors / OS
+# ---------------------------
+.vscode/
+.idea/
+.DS_Store
+
+# ---------------------------
+# Project data / temp / logs
+# ---------------------------
 data/
 temp/
+logs/
+*.log
+
+# ---------------------------
+# Audio artifacts (generated)
+# ---------------------------
 *.wav
 *.mp3
+*.m4a
+
+# ---------------------------
+# Secrets (절대 커밋 금지)
+# ---------------------------
+# 리포지토리 내부에 만들지 말고, 만들어졌다면 커밋 방지
+keys/
+etc/
+*.pem
+*.p12
+*.crt
+*.key
+
+# JSON은 전부 막지 않습니다(설정/스키마 추적에 필요할 수 있음)
+# 비밀 JSON만 선택적으로 무시하려면 아래 패턴을 추가하세요:
+# gcp-*.json
+# service-account-*.json
+# *-credentials.json
