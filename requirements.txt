@@ -9,3 +9,4 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 pytest>=8.2.0
 rich>=13.8.0
+python-multipart
