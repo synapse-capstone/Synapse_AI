@@ -1,14 +1,36 @@
-from src.dialogue.manager import DialogueCtx, next_turn
+# src/tests/test_edge_cases.py
 
-def test_empty_reprompt():
-    ctx = DialogueCtx()
-    # 빈 입력(무음/짧은 발화) → 초기 안내 혹은 재프롬프트가 나와야 함
-    out = next_turn(ctx, "")
-    assert isinstance(out, str) and len(out) > 0
+def test_empty_input(client):
+    res = client.post("/session/start")
+    sid = res.json()["session_id"]
 
-def test_very_long_text_is_handled():
-    ctx = DialogueCtx()
-    long_text = "안녕하세요 " * 500  # 아주 긴 입력
-    out = next_turn(ctx, long_text)
-    # 예외 없이 문자열 응답만 오면 통과
-    assert isinstance(out, str) and len(out) > 0
+    res = client.post("/session/text", json={"session_id": sid, "text": ""})
+    assert "잘 못 들었어요" in res.json()["response_text"]
+
+
+def test_wrong_menu(client):
+    res = client.post("/session/start")
+    sid = res.json()["session_id"]
+
+    client.post("/session/text", json={"session_id": sid, "text": "포장"})
+    client.post("/session/text", json={"session_id": sid, "text": "커피"})
+
+    res = client.post("/session/text", json={"session_id": sid, "text": "이상한메뉴"})
+    assert "죄송해요" in res.json()["response_text"]
+
+
+def test_restart_after_no(client):
+    res = client.post("/session/start")
+    sid = res.json()["session_id"]
+
+    # 포장 → 커피 → 아메리카노 → temp → size → options → confirm
+    client.post("/session/text", json={"session_id": sid, "text": "포장"})
+    client.post("/session/text", json={"session_id": sid, "text": "커피"})
+    client.post("/session/text", json={"session_id": sid, "text": "아메리카노"})
+    client.post("/session/text", json={"session_id": sid, "text": "아이스"})
+    client.post("/session/text", json={"session_id": sid, "text": "톨"})
+    client.post("/session/text", json={"session_id": sid, "text": "샷 추가"})
+
+    # 주문 확인에서 “아니요”
+    res = client.post("/session/text", json={"session_id": sid, "text": "아니요"})
+    assert res.json()["context"]["step"] == "menu_category"

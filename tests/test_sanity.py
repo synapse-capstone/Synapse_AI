@@ -1,16 +1,11 @@
-import importlib, sys
+# src/tests/test_sanity.py
+def test_health(client):
+    res = client.get("/health")
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
 
-def test_imports():
-    pkgs = [
-        "openai",
-        "spacy",
-        "google.cloud.texttospeech",
-        "sounddevice",
-        "soundfile",
-    ]
-    # Python 3.13에서는 pydub가 audioop 대체 모듈을 찾지 못함
-    if sys.version_info < (3, 13):
-        pkgs.append("pydub")
 
-    for p in pkgs:
-        assert importlib.import_module(p)
+def test_version(client):
+    res = client.get("/version")
+    assert res.status_code == 200
+    assert "version" in res.json()
