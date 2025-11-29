@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Dict, Any
-import tempfile, os, uuid, time, re
+import tempfile, os, uuid, time, re, json
 from openai import OpenAI
 
 from src.stt.whisper_client import transcribe_file
@@ -85,7 +85,8 @@ def _expired(ts: float) -> bool:
 def _new_session_ctx() -> Dict[str, Any]:
     """새 세션 기본 상태."""
     return {
-        "step": "dine_type",      # dine_type -> menu_category -> menu_item -> temp -> size -> options -> confirm -> payment -> done
+        # dine_type -> menu_category -> menu_item -> temp -> size -> options -> confirm -> payment -> done
+        "step": "dine_type",
         "turns": 0,
         "dine_type": None,        # takeout / dinein
         "category": None,         # coffee / ade / tea / dessert
@@ -152,6 +153,7 @@ def _maybe_close_if_too_long(sid: str, ctx: Dict[str, Any]):
             "tts_url": _make_tts_url(tts),
             "context": None,
             "backend_payload": None,
+            "target_element_id": None,
         }
     return None
 
@@ -396,21 +398,145 @@ def _build_backend_payload(ctx: Dict[str, Any]) -> dict | None:
 
 
 # ───────────────────────────────────────────────
+# UI 도움말용 LLM 프롬프트 & 함수 (target_element_id)
+# ───────────────────────────────────────────────
+UI_SYSTEM_PROMPT = """
+너는 노인 친화 카페 키오스크의 음성 안내 도우미야.
+
+- 사용자는 한국어로 버튼이나 영역이 "어디 있는지"를 물어본다.
+- 너의 역할은:
+  1) 사용자가 찾고 있는 UI 요소가 무엇인지 판단해서,
+  2) 아래 목록 중 알맞은 target_element_id를 고르고,
+  3) 그에 맞는 안내 문장을 answer_text에 넣어
+  4) JSON으로만 반환하는 것이다.
+
+가능한 target_element_id 목록:
+메뉴 리스트 화면
+- menu_home_button
+- menu_pay_button
+- menu_cart_area
+
+온도 선택 화면
+- temp_prev_button
+- temp_next_button
+
+사이즈 선택 화면
+- size_prev_button
+- size_next_button
+
+옵션 선택 화면
+- option_prev_button
+- option_next_button
+
+결제 리스트 화면 (주문 요약 모달)
+- payment_prev_button
+- payment_pay_button
+
+QR 생성하기 팝업 (전화번호 입력)
+- qr_cancel_button
+- qr_send_button
+
+규칙:
+- target_element_id는 위 목록 중 하나만 사용해야 한다.
+- 모르면 target_element_id에는 null을 넣고,
+  answer_text는 "어느 버튼을 찾으시는지 다시 한번 말씀해 주세요."라고 해라.
+- answer_text는 노인이 이해하기 쉽게, 존댓말로, 1~2문장으로 안내해라.
+- 반드시 아래 JSON 형식으로만 출력해라. 다른 텍스트는 절대 쓰지 마라.
+
+JSON 형식:
+{
+  "target_element_id": string | null,
+  "answer_text": string
+}
+""".strip()
+
+UI_FEW_SHOTS = """
+예시 1)
+사용자: 결제 버튼 어딨어?
+응답:
+{
+  "target_element_id": "menu_pay_button",
+  "answer_text": "메뉴 선택을 다 하셨으면, 화면 오른쪽 아래 파란색 ‘결제하기’ 버튼을 눌러 주세요."
+}
+
+예시 2)
+사용자: 장바구니는 어디 있어?
+응답:
+{
+  "target_element_id": "menu_cart_area",
+  "answer_text": "화면 아래쪽 가운데에 있는 ‘장바구니’ 영역에서 주문하신 메뉴를 보실 수 있습니다."
+}
+
+예시 3)
+사용자: 처음으로 돌아가는 거 어디야?
+응답:
+{
+  "target_element_id": "menu_home_button",
+  "answer_text": "화면 오른쪽 상단에 있는 동그란 ‘홈’ 버튼을 눌러 주세요."
+}
+""".strip()
+
+
+def looks_like_ui_help(text: str) -> bool:
+    """
+    화면에서 버튼/영역 위치를 묻는 발화인지 간단 키워드로 감지.
+    """
+    t = text.replace(" ", "")
+    keywords = [
+        "버튼", "어디", "어딨어", "뒤로", "이전", "다음", "홈",
+        "장바구니", "결제", "처음으로", "취소", "전송", "qr", "큐알"
+    ]
+    return any(k in t for k in keywords)
+
+
+def classify_ui_target(user_text: str) -> dict:
+    """
+    OpenAI에 UI용 프롬프트로 물어보고
+    { "target_element_id": ..., "answer_text": ... } 형태로 반환.
+    """
+    completion = gpt_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": UI_SYSTEM_PROMPT},
+            {"role": "user", "content": UI_FEW_SHOTS},
+            {"role": "user", "content": f"사용자: {user_text}\n응답:"},
+        ],
+        temperature=0.1,
+        max_tokens=150,
+    )
+
+    raw = completion.choices[0].message.content.strip()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {
+            "target_element_id": None,
+            "answer_text": "어느 버튼을 찾으시는지 다시 한번 말씀해 주세요."
+        }
+
+    # 방어적 필드 정리
+    if "target_element_id" not in data:
+        data["target_element_id"] = None
+    if "answer_text" not in data:
+        data["answer_text"] = "어느 버튼을 찾으시는지 다시 한번 말씀해 주세요."
+
+    return data
+
+
+# ───────────────────────────────────────────────
 # OpenAI helper mode (대화형 자유 질문 답변)
 # ───────────────────────────────────────────────
 def looks_like_general_question(text: str) -> bool:
     """
     사용자가 메뉴/단계 외 일반 질문을 하는 상황 감지.
-    예: '현금 돼?', '뒤로 가는 버튼 어디야?'
+    예: '현금 돼?', '현금으로도 결제 돼?'
+    (UI 위치 질문은 looks_like_ui_help가 먼저 처리함)
     """
     t = text.strip()
 
     # 결제 관련 질문
-    if re.search(r"(현금|카드|결제)\s*(되|가능)", t):
-        return True
-
-    # UI 관련 질문
-    if re.search(r"(버튼|어디|화면|뒤로)", t):
+    if re.search(r"(현금|카드|결제)\s*(되|가능|돼)", t):
         return True
 
     # 안내 요청
@@ -514,14 +640,14 @@ def _order_summary_sentence(ctx: Dict[str, Any]) -> str:
 
 
 # ───────────────────────────────────────────────
-# 대화 흐름 함수 (open-mode + 주문 플로우)
+# 대화 흐름 함수 (주문 플로우 + 일반 질문)
 # ───────────────────────────────────────────────
 def _handle_turn(ctx: Dict[str, Any], user_text: str) -> str:
     text = (user_text or "").strip()
     step = ctx.get("step", "dine_type")
     category = ctx.get("category")
 
-    # 0) 일반 질문 감지 → OpenAI로 답변
+    # 일반 질문 감지 → OpenAI로 답변 (UI 위치 질문은 상위에서 이미 처리)
     if looks_like_general_question(text):
         return answer_general_question(text)
 
@@ -684,6 +810,7 @@ def session_text(payload: TextIn):
             "tts_url": _make_tts_url(tts_path) or None,
             "context": _ctx_snapshot(ctx),
             "backend_payload": _build_backend_payload(ctx),
+            "target_element_id": None,
         }
 
     # 턴 수 가드
@@ -691,7 +818,31 @@ def session_text(payload: TextIn):
     if guard:
         return guard
 
-    # 정상 처리 (주문 + 일반 질문 통합)
+    text = (payload.text or "").strip()
+
+    # 1) 프론트에서 is_help=True를 보냈거나, UI 도움말로 보이는 발화면 → UI 모드
+    if payload.is_help or looks_like_ui_help(text):
+        ui_info = classify_ui_target(text)
+        resp_text = ui_info.get(
+            "answer_text",
+            "어느 버튼을 찾으시는지 다시 한번 말씀해 주세요."
+        )
+        target_element_id = ui_info.get("target_element_id")
+
+        tts_path = synthesize(resp_text, out_path=f"response_{sid}.mp3")
+        SESS_META[sid] = _now()
+
+        return {
+            "stt_text": payload.text,
+            "response_text": resp_text,
+            "tts_path": tts_path,
+            "tts_url": _make_tts_url(tts_path) or None,
+            "context": _ctx_snapshot(ctx),           # 주문 상태는 유지
+            "backend_payload": _build_backend_payload(ctx),
+            "target_element_id": target_element_id,  # 프론트에서 하이라이트 용도로 사용
+        }
+
+    # 2) 그 외에는 기존 주문/일반 질문 흐름 사용
     resp_text = _handle_turn(ctx, payload.text)
     tts_path = synthesize(resp_text, out_path=f"response_{sid}.mp3")
     SESS_META[sid] = _now()
@@ -703,6 +854,7 @@ def session_text(payload: TextIn):
         "tts_url": _make_tts_url(tts_path) or None,
         "context": _ctx_snapshot(ctx),
         "backend_payload": _build_backend_payload(ctx),
+        "target_element_id": None,
     }
 
 
@@ -741,6 +893,7 @@ async def session_voice(session_id: str, audio: UploadFile = File(...)):
             "tts_url": _make_tts_url(tts_path) or None,
             "context": _ctx_snapshot(ctx),
             "backend_payload": _build_backend_payload(ctx),
+            "target_element_id": None,
         }
 
     # 턴 수 가드
@@ -748,7 +901,31 @@ async def session_voice(session_id: str, audio: UploadFile = File(...)):
     if guard:
         return guard
 
-    # 정상 처리
+    text = (user_text or "").strip()
+
+    # 음성에서도 UI 도움말 발화면 같은 로직 적용
+    if looks_like_ui_help(text):
+        ui_info = classify_ui_target(text)
+        resp_text = ui_info.get(
+            "answer_text",
+            "어느 버튼을 찾으시는지 다시 한번 말씀해 주세요."
+        )
+        target_element_id = ui_info.get("target_element_id")
+
+        tts_path = synthesize(resp_text, out_path=f"response_{sid}.mp3")
+        SESS_META[sid] = _now()
+
+        return {
+            "stt_text": user_text,
+            "response_text": resp_text,
+            "tts_path": tts_path,
+            "tts_url": _make_tts_url(tts_path) or None,
+            "context": _ctx_snapshot(ctx),
+            "backend_payload": _build_backend_payload(ctx),
+            "target_element_id": target_element_id,
+        }
+
+    # 정상 주문/일반질문 처리
     resp_text = _handle_turn(ctx, user_text)
     tts_path = synthesize(resp_text, out_path=f"response_{sid}.mp3")
     SESS_META[sid] = _now()
@@ -760,6 +937,7 @@ async def session_voice(session_id: str, audio: UploadFile = File(...)):
         "tts_url": _make_tts_url(tts_path) or None,
         "context": _ctx_snapshot(ctx),
         "backend_payload": _build_backend_payload(ctx),
+        "target_element_id": None,
     }
 
 
