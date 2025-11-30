@@ -2,11 +2,12 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSock
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Dict, Any, Iterable
-import tempfile, os, uuid, time, re, asyncio
+import tempfile, os, uuid, time, re, asyncio, json
 import io
 
 from pydub import AudioSegment
 from pydub.utils import which
+from openai import OpenAI
 
 from src.stt.whisper_client import transcribe_file
 from src.tts.tts_client import synthesize
@@ -20,6 +21,9 @@ SESS_META: Dict[str, float] = {}           # session_id -> last_active
 SESSION_TTL = 600                          # 10분
 MAX_TURNS = 20                             # 과도한 대화 방지
 ACCEPTED_EXT = {".wav", ".mp3", ".m4a", ".3gp"}    # 업로드 허용 포맷
+
+# OpenAI 클라이언트 (환경변수 OPENAI_API_KEY 사용)
+gpt_client = OpenAI()
 
 def _find_local_ffmpeg() -> str | None:
     tools_dir = os.path.abspath("tools")
@@ -73,29 +77,35 @@ if _FFMPEG_PATH:
 TTS_DIR = os.path.abspath(".cache_tts")  # 프로젝트 루트 기준
 _TTS_NAME_RE = re.compile(r"^[a-f0-9]{32}\.mp3$", re.IGNORECASE)
 
+# TTS 파일
+TTS_DIR = os.path.abspath(".cache_tts")
+_TTS_NAME_RE = re.compile(r"^[a-f0-9]{32}\.mp3$", re.IGNORECASE)
+
 
 def _tts_path_from_name(name: str) -> str:
-    """파일명 검증 + 디렉터리 탈출 방지."""
+    """TTS 캐시 파일 이름 검증 및 경로 확보."""
     if not _TTS_NAME_RE.match(name):
-        raise HTTPException(status_code=400, detail="잘못된 파일명 형식")
+        raise HTTPException(status_code=400, detail="잘못된 파일명 형식입니다.")
+
     abs_path = os.path.abspath(os.path.join(TTS_DIR, name))
+
     if not abs_path.startswith(TTS_DIR + os.sep):
-        raise HTTPException(status_code=400, detail="경로가 올바르지 않습니다")
+        raise HTTPException(status_code=400, detail="경로가 유효하지 않습니다.")
+
     if not os.path.exists(abs_path):
-        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다")
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
     return abs_path
 
 
 def _make_tts_url(tts_path: str) -> str:
-    """
-    응답에 절대 URL을 포함하고 싶을 때 사용.
-    BASE_URL은 배포 시 환경변수로 설정 권장.
-    """
+    """프론트에서 재생할 수 있는 절대 URL 생성."""
     base = os.getenv("BASE_URL", "http://127.0.0.1:8000")
     fname = os.path.basename(tts_path)
     if not _TTS_NAME_RE.match(fname):
         return ""
     return f"{base}/tts/{fname}"
+
 
 
 def _ensure_wav(path: str) -> tuple[str, list[str]]:
@@ -147,10 +157,10 @@ def _cleanup_temp_files(paths: Iterable[str]) -> None:
             pass
 
 
-# ── 모델 ──────────────────────────────────────────────────────────────────────
 class TextIn(BaseModel):
     session_id: str
     text: str
+    is_help: bool = False  # 프론트에서 "도움말 모드" 플래그를 줄 수도 있음 (안 써도 됨)
 
 
 class StartOut(BaseModel):
@@ -162,7 +172,9 @@ class StartOut(BaseModel):
     backend_payload: dict | None = None
 
 
-# ── 유틸 ──────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────
+# 유틸
+# ───────────────────────────────────────────────
 def _now() -> float:
     return time.time()
 
@@ -178,24 +190,24 @@ def _new_session_ctx() -> Dict[str, Any]:
         # greeting -> dine_type -> menu_item -> temp/size -> options -> add_more -> review -> phone -> payment -> card -> done
         "step": "greeting",
         "turns": 0,
-        "dine_type": None,       # takeout / dinein
-        "category": None,        # coffee / ade / tea / dessert
-        "menu_id": None,         # COFFEE_AMERICANO ...
-        "menu_name": None,       # "아메리카노" ...
-        "temp": None,            # hot / ice
-        "size": None,            # tall / grande / venti / ...
+        "dine_type": None,        # takeout / dinein
+        "category": None,         # coffee / ade / tea / dessert
+        "menu_id": None,
+        "menu_name": None,
+        "temp": None,             # hot / ice
+        "size": None,             # tall / grande / venti / ...
         "options": {
-            "extra_shot": 0,     # 커피: 샷 추가
-            "syrup": False,      # 커피: 시럽 추가 여부
-            "decaf": None,       # 커피: True/False
-            "sweetness": None,   # 에이드: low / normal / high
+            "extra_shot": 0,      # 커피: 샷 추가
+            "syrup": False,       # 커피: 시럽 추가
+            "decaf": None,        # 커피: 디카페인 여부
+            "sweetness": None,    # 에이드: low / normal / high
         },
         "quantity": 1,
-        "payment_method": None,  # card / cash / kakaopay / ...
+        "payment_method": None,   # card / cash / kakaopay / ...
     }
 
 
-def _ensure_session(session_id: str | None = None) -> tuple[str, Dict[str, Any]]:
+def _ensure_session(session_id: str | None = None):
     if session_id and session_id in SESSIONS and not _expired(SESS_META.get(session_id, 0)):
         ctx = SESSIONS[session_id]
     else:
@@ -206,38 +218,8 @@ def _ensure_session(session_id: str | None = None) -> tuple[str, Dict[str, Any]]
     return session_id, ctx
 
 
-def _reprompt_if_empty(text: str | None) -> str | None:
-    """
-    무음/빈 문자열 기본 처리.
-    '네', '응' 같은 한 글자 대답은 정상 입력으로 처리하기 위해
-    길이 체크는 하지 않고, 진짜 공백/None일 때만 재질문.
-    """
-    if text is None or not text.strip():
-        return "죄송해요, 잘 못 들었어요. 다시 한번 말씀해 주시겠어요?"
-    return None
-
-
-def _maybe_close_if_too_long(sid: str, ctx: Dict[str, Any]):
-    """턴 수가 MAX_TURNS를 넘으면 세션 종료 안내 후 초기화."""
-    ctx["turns"] = ctx.get("turns", 0) + 1
-    if ctx["turns"] > MAX_TURNS:
-        resp_text = "대화 시간이 길어져서 새로 시작할게요. 처음 화면으로 돌아갑니다."
-        tts_path = synthesize(resp_text, out_path=f"response_{sid}.mp3")
-        # 세션 정리
-        SESSIONS.pop(sid, None)
-        SESS_META.pop(sid, None)
-        return {
-            "response_text": resp_text,
-            "tts_path": tts_path,
-            "tts_url": _make_tts_url(tts_path) or None,
-            "context": None,
-            "backend_payload": None,
-        }
-    return None
-
-
 def _ctx_snapshot(ctx: Dict[str, Any]) -> dict:
-    """프론트/백엔드 참고용 현재 상태 스냅샷."""
+    """프론트/백엔드에 내려줄 현재 상태 요약."""
     return {
         "step": ctx.get("step"),
         "dine_type": ctx.get("dine_type"),
@@ -252,12 +234,40 @@ def _ctx_snapshot(ctx: Dict[str, Any]) -> dict:
     }
 
 
-# ── 파싱 유틸 ─────────────────────────────────────────────────────────────────
+def _reprompt_if_empty(text: str | None) -> str | None:
+    """완전 공백일 때만 재질문. '네', '응' 같은 한 글자는 허용."""
+    if text is None or not text.strip():
+        return "죄송해요, 잘 못 들었어요. 다시 한 번 말씀해 주세요."
+    return None
+
+
+def _maybe_close_if_too_long(sid: str, ctx: Dict[str, Any]):
+    """턴 수가 많아지면 세션 정리."""
+    ctx["turns"] = ctx.get("turns", 0) + 1
+    if ctx["turns"] > MAX_TURNS:
+        resp = "대화가 길어져서 새로 시작할게요. 처음부터 다시 진행합니다."
+        tts = synthesize(resp, out_path=f"response_{sid}.mp3")
+        SESSIONS.pop(sid, None)
+        SESS_META.pop(sid, None)
+        return {
+            "response_text": resp,
+            "tts_path": tts,
+            "tts_url": _make_tts_url(tts),
+            "context": None,
+            "backend_payload": None,
+            "target_element_id": None,
+        }
+    return None
+
+
+# ───────────────────────────────────────────────
+# 파싱 함수들 (dine_type, category, menu, temp, size, options, payment)
+# ───────────────────────────────────────────────
 def _parse_dine_type(text: str) -> str | None:
     t = text.replace(" ", "")
     if "포장" in t or "들고갈" in t or "가져갈" in t:
         return "takeout"
-    if "먹고갈" in t or "매장" in t or "여기서" in t:
+    if "매장" in t or "먹고갈" in t or "여기서" in t:
         return "dinein"
     return None
 
@@ -275,8 +285,7 @@ def _parse_category(text: str) -> str | None:
     return None
 
 
-def _menu_choices_for_category(cat: str) -> list[tuple[str, str]]:
-    """카테고리별 (menu_id, menu_name) 리스트."""
+def _menu_choices_for_category(cat: str):
     if cat == "coffee":
         return [
             ("COFFEE_AMERICANO", "아메리카노"),
@@ -378,69 +387,58 @@ def _parse_menu_item(category: str | None, text: str) -> tuple[str, str, str] | 
 
 
 def _parse_temp(text: str) -> str | None:
-    t = text.replace(" ", "").lower()
-    if "아이스" in t or "ice" in t or "차갑" in t:
+    t = text.replace(" ", "")
+    if "아이스" in t or "차갑" in t:
         return "ice"
-    if "핫" in t or "hot" in t or "따뜻" in t or "뜨거" in t or "뜨겁" in t:
+    if "뜨겁" in t or "뜨거" in t or "따뜻" in t or "핫" in t:
         return "hot"
     return None
 
 
 def _parse_size(text: str) -> str | None:
     t = text.replace(" ", "").lower()
-    if "톨" in t or "tall" in t:
+    if "톨" in t:
         return "tall"
-    if "그란데" in t or "grande" in t:
+    if "그란데" in t:
         return "grande"
-    if "벤티" in t or "venti" in t:
+    if "벤티" in t:
         return "venti"
-    if "스몰" in t or "small" in t or "작은" in t:
+    if "스몰" in t:
         return "small"
-    if "미디엄" in t or "medium" in t or "중간" in t:
+    if "미디엄" in t:
         return "medium"
-    if "라지" in t or "large" in t or "큰" in t:
+    if "라지" in t:
         return "large"
     return None
 
 
-def _parse_options(category: str | None, text: str, options: dict) -> dict:
-    """카테고리별 옵션 파싱."""
+def _parse_options(category: str, text: str, options: dict):
     t = text.replace(" ", "").lower()
 
     if category == "coffee":
         # 디카페인
-        if "디카페인" in t or "디카" in t:
+        if "디카" in t or "디카페인" in t:
             options["decaf"] = True
-        elif "일반" in t and "카페인" in t:
-            options["decaf"] = False
-
         # 시럽
-        if "시럽" in t and ("추가" in t or "넣어" in t):
+        if "시럽" in t:
             options["syrup"] = True
-
         # 샷 추가
-        extra = options.get("extra_shot", 0)
         if "샷" in t:
             if "두" in t or "2" in t:
-                extra = 2
+                options["extra_shot"] = 2
             elif "세" in t or "3" in t:
-                extra = 3
-            elif "한" in t or "1" in t:
-                extra = 1
+                options["extra_shot"] = 3
             else:
-                extra = max(extra, 1)
-        options["extra_shot"] = extra
+                options["extra_shot"] = 1
 
     elif category == "ade":
-        # 당도: 연하게/보통/달게
-        if any(x in t for x in ["연하게", "적게", "연한", "조금달게"]):
+        if "연하게" in t or "적게" in t:
             options["sweetness"] = "low"
-        elif any(x in t for x in ["보통", "기본", "그냥"]):
+        elif "보통" in t or "기본" in t:
             options["sweetness"] = "normal"
-        elif any(x in t for x in ["달게", "많이달게", "달달", "많이달"]):
+        elif "달게" in t or "많이" in t or "달달" in t:
             options["sweetness"] = "high"
 
-    # tea, dessert는 별도 옵션 없음 (size/temp만 사용)
     return options
 
 
@@ -450,10 +448,8 @@ def _parse_payment(text: str) -> str | None:
         return "card"
     if "현금" in t:
         return "cash"
-    if "카카오페이" in t or "카톡페이" in t:
+    if "카카오페이" in t:
         return "kakaopay"
-    if "삼성페이" in t:
-        return "samsungpay"
     if "페이" in t:
         return "pay"
     return None
@@ -461,14 +457,16 @@ def _parse_payment(text: str) -> str | None:
 
 def _yes_no(text: str) -> str | None:
     t = text.replace(" ", "")
-    if any(x in t for x in ["네", "응", "예", "맞아요", "맞아", "좋아요", "그래"]):
+    if t in ("네", "응", "예", "맞아", "맞아요", "그래", "좋아요"):
         return "yes"
-    if any(x in t for x in ["아니", "아니요", "싫", "다시"]):
+    if t in ("아니", "아니요", "싫어", "싫어요", "다시"):
         return "no"
     return None
 
 
-# ── backend_payload 생성 ─────────────────────────────────────────────────────
+# ───────────────────────────────────────────────
+# backend_payload 생성
+# ───────────────────────────────────────────────
 def _build_backend_payload(ctx: Dict[str, Any]) -> dict | None:
     """
     현재까지의 선택을 기반으로 백엔드에 넘길 주문 JSON 예시 생성.
@@ -521,7 +519,190 @@ def _build_backend_payload(ctx: Dict[str, Any]) -> dict | None:
     }
 
 
-# ── 주문 요약 문장 생성 ──────────────────────────────────────────────────────
+# ───────────────────────────────────────────────
+# UI 도움말용 LLM 프롬프트 & 함수 (target_element_id)
+# ───────────────────────────────────────────────
+UI_SYSTEM_PROMPT = """
+너는 노인 친화 카페 키오스크의 음성 안내 도우미야.
+
+- 사용자는 한국어로 버튼이나 영역이 "어디 있는지"를 물어본다.
+- 너의 역할은:
+  1) 사용자가 찾고 있는 UI 요소가 무엇인지 판단해서,
+  2) 아래 목록 중 알맞은 target_element_id를 고르고,
+  3) 그에 맞는 안내 문장을 answer_text에 넣어
+  4) JSON으로만 반환하는 것이다.
+
+가능한 target_element_id 목록:
+메뉴 리스트 화면
+- menu_home_button
+- menu_pay_button
+- menu_cart_area
+
+온도 선택 화면
+- temp_prev_button
+- temp_next_button
+
+사이즈 선택 화면
+- size_prev_button
+- size_next_button
+
+옵션 선택 화면
+- option_prev_button
+- option_next_button
+
+결제 리스트 화면 (주문 요약 모달)
+- payment_prev_button
+- payment_pay_button
+
+QR 생성하기 팝업 (전화번호 입력)
+- qr_cancel_button
+- qr_send_button
+
+규칙:
+- target_element_id는 위 목록 중 하나만 사용해야 한다.
+- 모르면 target_element_id에는 null을 넣고,
+  answer_text는 "어느 버튼을 찾으시는지 다시 한번 말씀해 주세요."라고 해라.
+- answer_text는 노인이 이해하기 쉽게, 존댓말로, 1~2문장으로 안내해라.
+- 반드시 아래 JSON 형식으로만 출력해라. 다른 텍스트는 절대 쓰지 마라.
+
+JSON 형식:
+{
+  "target_element_id": string | null,
+  "answer_text": string
+}
+""".strip()
+
+UI_FEW_SHOTS = """
+예시 1)
+사용자: 결제 버튼 어딨어?
+응답:
+{
+  "target_element_id": "menu_pay_button",
+  "answer_text": "메뉴 선택을 다 하셨으면, 화면 오른쪽 아래 파란색 ‘결제하기’ 버튼을 눌러 주세요."
+}
+
+예시 2)
+사용자: 장바구니는 어디 있어?
+응답:
+{
+  "target_element_id": "menu_cart_area",
+  "answer_text": "화면 아래쪽 가운데에 있는 ‘장바구니’ 영역에서 주문하신 메뉴를 보실 수 있습니다."
+}
+
+예시 3)
+사용자: 처음으로 돌아가는 거 어디야?
+응답:
+{
+  "target_element_id": "menu_home_button",
+  "answer_text": "화면 오른쪽 상단에 있는 동그란 ‘홈’ 버튼을 눌러 주세요."
+}
+""".strip()
+
+
+def looks_like_ui_help(text: str) -> bool:
+    """
+    화면에서 버튼/영역 위치를 묻는 발화인지 간단 키워드로 감지.
+    """
+    t = text.replace(" ", "")
+    keywords = [
+        "버튼", "어디", "어딨어", "뒤로", "이전", "다음", "홈",
+        "장바구니", "결제", "처음으로", "취소", "전송", "qr", "큐알"
+    ]
+    return any(k in t for k in keywords)
+
+
+def classify_ui_target(user_text: str) -> dict:
+    """
+    OpenAI에 UI용 프롬프트로 물어보고
+    { "target_element_id": ..., "answer_text": ... } 형태로 반환.
+    """
+    completion = gpt_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": UI_SYSTEM_PROMPT},
+            {"role": "user", "content": UI_FEW_SHOTS},
+            {"role": "user", "content": f"사용자: {user_text}\n응답:"},
+        ],
+        temperature=0.1,
+        max_tokens=150,
+    )
+
+    raw = completion.choices[0].message.content.strip()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {
+            "target_element_id": None,
+            "answer_text": "어느 버튼을 찾으시는지 다시 한번 말씀해 주세요."
+        }
+
+    # 방어적 필드 정리
+    if "target_element_id" not in data:
+        data["target_element_id"] = None
+    if "answer_text" not in data:
+        data["answer_text"] = "어느 버튼을 찾으시는지 다시 한번 말씀해 주세요."
+
+    return data
+
+
+# ───────────────────────────────────────────────
+# OpenAI helper mode (대화형 자유 질문 답변)
+# ───────────────────────────────────────────────
+def looks_like_general_question(text: str) -> bool:
+    """
+    사용자가 메뉴/단계 외 일반 질문을 하는 상황 감지.
+    예: '현금 돼?', '현금으로도 결제 돼?'
+    (UI 위치 질문은 looks_like_ui_help가 먼저 처리함)
+    """
+    t = text.strip()
+
+    # 결제 관련 질문
+    if re.search(r"(현금|카드|결제)\s*(되|가능|돼)", t):
+        return True
+
+    # 안내 요청
+    if "어떻게" in t or "방법" in t:
+        return True
+
+    # '메뉴 추천해줘', '뭐가 맛있어?' 등
+    if re.search(r"(추천|맛있|뭐먹|뭐가)", t):
+        return True
+
+    # '?' 포함된 질문
+    if t.endswith("?"):
+        return True
+
+    return False
+
+
+def answer_general_question(text: str) -> str:
+    """
+    OpenAI API를 사용해 kiosk 안내 톤으로 대답 생성.
+    """
+    prompt = f"""
+당신은 카페 키오스크 앞에서 손님을 도와주는 안내 도우미입니다.
+손님이 한 질문: "{text}"
+
+조건:
+- 대답은 1~2문장, 짧고 명확하게.
+- 너무 기술적인 설명은 피하고, 안내 말투로 설명.
+- 존댓말 사용.
+"""
+
+    completion = gpt_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=80,
+        temperature=0.6,
+    )
+
+    return completion.choices[0].message.content.strip()
+
+
+# ───────────────────────────────────────────────
+# 주문 요약 문장 생성
+# ───────────────────────────────────────────────
 def _order_summary_sentence(ctx: Dict[str, Any]) -> str:
     category = ctx.get("category")
     menu_name = ctx.get("menu_name") or {
@@ -714,15 +895,11 @@ def _cart_added_sentence(ctx: Dict[str, Any]) -> str:
     return f"{order_info}가 장바구니에 담겼습니다. 이어서 주문을 진행하시거나 결제하기 버튼을 눌러주세요."
 
 
-# ── 메인 대화 흐름 로직 ──────────────────────────────────────────────────────
 def _handle_turn(ctx: Dict[str, Any], user_text: str) -> str:
-    """
-    한 턴의 입력(user_text)에 대해,
-    ctx 상태를 업데이트하고, 사용자에게 들려줄 response_text를 반환.
-    """
     text = (user_text or "").strip()
     step = ctx.get("step", "greeting")
     category = ctx.get("category")
+
 
     # 0) 인사 단계
     if step == "greeting":
@@ -734,10 +911,15 @@ def _handle_turn(ctx: Dict[str, Any], user_text: str) -> str:
         return "안녕하세요. AI음성 키오스크 말로입니다. 주문을 도와드릴게요."
 
     # 1) 먹고가기 / 들고가기
+
+    # 일반 질문 감지 → OpenAI로 답변 (UI 위치 질문은 상위에서 이미 처리)
+    if looks_like_general_question(text):
+        return answer_general_question(text)
+
+    # 1) 먹고가기 / 매장에서
     if step == "dine_type":
         dine = _parse_dine_type(text)
         if dine is None:
-            ctx["step"] = "dine_type"
             return "포장해서 가져가시나요, 매장에서 드시나요?"
         ctx["dine_type"] = dine
         
@@ -791,7 +973,7 @@ def _handle_turn(ctx: Dict[str, Any], user_text: str) -> str:
             ctx["step"] = "confirm"
             return _order_summary_sentence(ctx)
 
-    # 4) 온도 선택 (커피/차)
+    # 4) 온도 선택
     if step == "temp":
         # 이전 버튼 클릭 체크
         t = text.replace(" ", "").lower()
@@ -802,12 +984,14 @@ def _handle_turn(ctx: Dict[str, Any], user_text: str) -> str:
             return "주문을 다시 진행해주세요."
         
         temp = _parse_temp(text)
+
         if temp is None:
             return "따뜻하게 드실지, 차갑게 드실지 말씀해 주세요. 예: '아이스로 주세요'."
         ctx["temp"] = temp
         ctx["step"] = "size"
         how = "아이스" if temp == "ice" else "뜨겁게"
         return f"{how}로 준비할게요. 사이즈는 작은 사이즈, 중간 사이즈, 큰 사이즈 중에서 선택해 주세요."
+
 
     # 5) 사이즈 선택
     if step == "size":
@@ -854,7 +1038,7 @@ def _handle_turn(ctx: Dict[str, Any], user_text: str) -> str:
             ctx["step"] = "confirm"
             return _order_summary_sentence(ctx)
 
-    # 6) 옵션 선택 (커피/에이드)
+    # 6) 옵션 선택
     if step == "options":
         # 이전 버튼 클릭 체크
         t = text.replace(" ", "").lower()
@@ -870,7 +1054,7 @@ def _handle_turn(ctx: Dict[str, Any], user_text: str) -> str:
         ctx["step"] = "menu_item"
         return _cart_added_sentence(ctx)
 
-    # 7) 주문 내역 확인
+    # 7) 주문 확인
     if step == "confirm":
         # 이전 버튼 클릭 체크
         t = text.replace(" ", "").lower()
@@ -908,7 +1092,7 @@ def _handle_turn(ctx: Dict[str, Any], user_text: str) -> str:
             return "알겠습니다. 다시 원하시는 메뉴를 말씀해 주세요."
         return "주문이 맞으면 '네', 다시 선택하시려면 '아니요'라고 말씀해 주세요."
 
-    # 8) 결제 수단 선택
+    # 8) 결제 수단
     if step == "payment":
         # 이전 버튼 클릭 체크
         t = text.replace(" ", "").lower()
@@ -936,7 +1120,7 @@ def _handle_turn(ctx: Dict[str, Any], user_text: str) -> str:
             "samsungpay": "삼성페이",
             "coupon": "쿠폰",
         }.get(pay, "선택하신 결제 수단")
-        return f"{spoken_pay}로 결제 도와드릴게요. 주문이 완료되었습니다. 감사합니다."
+        return f"{spoken}로 결제 도와드릴게요. 주문이 완료되었습니다. 감사합니다."
 
     # 9) 카드 삽입 및 결제 완료
     if step == "card":
@@ -951,17 +1135,18 @@ def _handle_turn(ctx: Dict[str, Any], user_text: str) -> str:
 
     # 10) 주문 완료 후 새 주문
     if step == "done":
-        ctx.clear()
         ctx.update(_new_session_ctx())
         return "안녕하세요. AI음성 키오스크 말로입니다. 주문을 도와드릴게요."
 
-    # 안전장치: 알 수 없는 상태면 처음으로
-    ctx.clear()
+    # 비정상 상태 → 초기화
     ctx.update(_new_session_ctx())
     return "안녕하세요. AI음성 키오스크 말로입니다. 주문을 도와드릴게요."
 
 
-# ── 공개 엔드포인트 ───────────────────────────────────────────────────────────
+
+# ───────────────────────────────────────────────
+# FastAPI 엔드포인트들
+# ───────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -978,7 +1163,6 @@ def config_menu():
     return {"menus": menu_cfg, "options": opt_cfg}
 
 
-# ── 세션/대화 ─────────────────────────────────────────────────────────────────
 @app.post("/session/start", response_model=StartOut)
 def session_start():
     sid, ctx = _ensure_session()
@@ -986,6 +1170,7 @@ def session_start():
     ctx["step"] = "greeting"
     # _handle_turn을 호출하여 greeting 단계 응답 받기
     resp_text = _handle_turn(ctx, "")
+
     tts_path = synthesize(resp_text, out_path=f"response_{sid}.mp3")
     backend_payload = _build_backend_payload(ctx)
     return {
@@ -1006,14 +1191,14 @@ def session_text(payload: TextIn):
     maybe = _reprompt_if_empty(payload.text)
     if maybe:
         tts_path = synthesize(maybe, out_path=f"response_{sid}.mp3")
-        backend_payload = _build_backend_payload(ctx)
         return {
             "stt_text": payload.text,
             "response_text": maybe,
             "tts_path": tts_path,
             "tts_url": _make_tts_url(tts_path) or None,
             "context": _ctx_snapshot(ctx),
-            "backend_payload": backend_payload,
+            "backend_payload": _build_backend_payload(ctx),
+            "target_element_id": None,
         }
 
     # 턴 수 가드
@@ -1021,18 +1206,43 @@ def session_text(payload: TextIn):
     if guard:
         return guard
 
-    # 정상 처리
+    text = (payload.text or "").strip()
+
+    # 1) 프론트에서 is_help=True를 보냈거나, UI 도움말로 보이는 발화면 → UI 모드
+    if payload.is_help or looks_like_ui_help(text):
+        ui_info = classify_ui_target(text)
+        resp_text = ui_info.get(
+            "answer_text",
+            "어느 버튼을 찾으시는지 다시 한번 말씀해 주세요."
+        )
+        target_element_id = ui_info.get("target_element_id")
+
+        tts_path = synthesize(resp_text, out_path=f"response_{sid}.mp3")
+        SESS_META[sid] = _now()
+
+        return {
+            "stt_text": payload.text,
+            "response_text": resp_text,
+            "tts_path": tts_path,
+            "tts_url": _make_tts_url(tts_path) or None,
+            "context": _ctx_snapshot(ctx),           # 주문 상태는 유지
+            "backend_payload": _build_backend_payload(ctx),
+            "target_element_id": target_element_id,  # 프론트에서 하이라이트 용도로 사용
+        }
+
+    # 2) 그 외에는 기존 주문/일반 질문 흐름 사용
     resp_text = _handle_turn(ctx, payload.text)
     tts_path = synthesize(resp_text, out_path=f"response_{sid}.mp3")
     SESS_META[sid] = _now()
-    backend_payload = _build_backend_payload(ctx)
+
     return {
         "stt_text": payload.text,
         "response_text": resp_text,
         "tts_path": tts_path,
         "tts_url": _make_tts_url(tts_path) or None,
         "context": _ctx_snapshot(ctx),
-        "backend_payload": backend_payload,
+        "backend_payload": _build_backend_payload(ctx),
+        "target_element_id": None,
     }
 
 
@@ -1072,14 +1282,14 @@ async def session_voice(session_id: str, audio: UploadFile = File(...)):
     maybe = _reprompt_if_empty(user_text)
     if maybe:
         tts_path = synthesize(maybe, out_path=f"response_{sid}.mp3")
-        backend_payload = _build_backend_payload(ctx)
         return {
             "stt_text": user_text,
             "response_text": maybe,
             "tts_path": tts_path,
             "tts_url": _make_tts_url(tts_path) or None,
             "context": _ctx_snapshot(ctx),
-            "backend_payload": backend_payload,
+            "backend_payload": _build_backend_payload(ctx),
+            "target_element_id": None,
         }
 
     # 턴 수 가드
@@ -1087,18 +1297,43 @@ async def session_voice(session_id: str, audio: UploadFile = File(...)):
     if guard:
         return guard
 
-    # 정상 처리
+    text = (user_text or "").strip()
+
+    # 음성에서도 UI 도움말 발화면 같은 로직 적용
+    if looks_like_ui_help(text):
+        ui_info = classify_ui_target(text)
+        resp_text = ui_info.get(
+            "answer_text",
+            "어느 버튼을 찾으시는지 다시 한번 말씀해 주세요."
+        )
+        target_element_id = ui_info.get("target_element_id")
+
+        tts_path = synthesize(resp_text, out_path=f"response_{sid}.mp3")
+        SESS_META[sid] = _now()
+
+        return {
+            "stt_text": user_text,
+            "response_text": resp_text,
+            "tts_path": tts_path,
+            "tts_url": _make_tts_url(tts_path) or None,
+            "context": _ctx_snapshot(ctx),
+            "backend_payload": _build_backend_payload(ctx),
+            "target_element_id": target_element_id,
+        }
+
+    # 정상 주문/일반질문 처리
     resp_text = _handle_turn(ctx, user_text)
     tts_path = synthesize(resp_text, out_path=f"response_{sid}.mp3")
     SESS_META[sid] = _now()
-    backend_payload = _build_backend_payload(ctx)
+
     return {
-        "stt_text": user_text,   # STT 결과
+        "stt_text": user_text,
         "response_text": resp_text,
         "tts_path": tts_path,
         "tts_url": _make_tts_url(tts_path) or None,
         "context": _ctx_snapshot(ctx),
-        "backend_payload": backend_payload,
+        "backend_payload": _build_backend_payload(ctx),
+        "target_element_id": None,
     }
 
 
@@ -1111,13 +1346,9 @@ def session_state(session_id: str):
     return _ctx_snapshot(ctx)
 
 
-# ── TTS 파일 다운로드/스트리밍 ────────────────────────────────────────────────
 @app.get("/tts/{filename}")
 def get_tts_file(filename: str):
-    """
-    생성된 TTS mp3를 내려주는 엔드포인트.
-    - filename: 예) 'd96d9e768275ce350fb49bdf3f248ab1.mp3'
-    """
+    """생성된 TTS mp3를 내려주는 엔드포인트."""
     path = _tts_path_from_name(filename)
     return FileResponse(path, media_type="audio/mpeg", filename=filename)
 
