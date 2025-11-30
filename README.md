@@ -189,7 +189,8 @@ pytest -q
 
 • 세션 TTL = 10분
 • 최대 20턴 → 이후 자동 종료 안내
-• 허용 오디오: wav, mp3, m4a
+• 허용 오디오: wav, mp3, m4a, 3gp (서버에서 자동으로 WAV로 변환)
+• ffmpeg 설치 필요 (PATH 추가 또는 환경변수 FFMPEG_BINARY로 경로 지정)
 • TTS 파일 캐싱: .cache_tts/
 
 🚀 배포 안내

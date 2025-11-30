@@ -1,5 +1,7 @@
 import re
 
+from src.nlp.general_qa import answer_general_question, should_route_to_qa
+
 CART = []
 
 MENU = {
@@ -59,6 +61,8 @@ def handle(intent):
     return "죄송해요. 잘 이해하지 못했어요. 다시 말씀해 주시겠어요?"
 
 def run_once(text: str):
+    if should_route_to_qa(text):
+        return answer_general_question(text)
     intent = parse_intent(text)
     return handle(intent)
 
