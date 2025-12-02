@@ -150,9 +150,8 @@ src/
 • 허용 오디오: wav, mp3, m4a, 3gp (서버에서 자동으로 WAV로 변환)
 • ffmpeg 설치 필요 (PATH 추가 또는 환경변수 FFMPEG_BINARY로 경로 지정)
 • TTS 파일 캐싱: .cache_tts/
-현재 버전에서는 모든 대화 흐름과 UI 도움말 로직이 app.py 안에 구현되어 있습니다.
+• 현재 버전에서는 모든 대화 흐름과 UI 도움말 로직이 app.py 안에 구현되어 있습니다.
 
----
 
 ## 사전 준비
 
@@ -183,6 +182,20 @@ uvicorn src.server.app:app --reload --port 8000
 * GET /health
 * GET /version
 * GET /config/menu
+
+---
+
+## 프론트엔드 연동
+
+프론트엔드 연동 방법은 **[FRONTEND_INTEGRATION.md](./FRONTEND_INTEGRATION.md)** 문서를 참고하세요.
+
+주요 내용:
+- API 엔드포인트 상세 설명
+- 요청/응답 형식
+- 장바구니 추가/제거 처리
+- UI 요소 하이라이트 처리
+- 복합 액션 (제거 + 추가) 처리
+- 프론트엔드 코드 예시
 
 ---
 
